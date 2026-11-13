@@ -25,14 +25,14 @@ def validate_vat_calculation(r_doc: dict, default_rate: float = 20.0, calc_missi
         satz = default_rate
 
     # Fall 1: Netto und MwSt sind auf dem Beleg gedruckt -> Rechnerische Verprobung
-    if netto_beleg > 0 and mwst_beleg > 0:
+    if netto_beleg > 0 and mwst_beleg > 0 and not r_doc.get("_partial_missing_vat"):
         erwartet_mwst = round(netto_beleg * (satz / 100.0), 2)
         erwartet_brutto = round(netto_beleg + mwst_beleg, 2)
         if abs(erwartet_brutto - brutto) <= 0.05 and abs(erwartet_mwst - mwst_beleg) <= 0.05:
             return netto_beleg, mwst_beleg, satz, f"OK - MwSt ({satz:.0f}%) korrekt ausgewiesen"
         return netto_beleg, mwst_beleg, satz, f"FEHLER - Rechenfehler auf Beleg (Erwartet: {erwartet_mwst:.2f} €)"
 
-    # Fall 2: Nur Brutto auf Beleg vorhanden (MwSt-Ausweis fehlt!)
+    # Fall 2: Nur Brutto auf Beleg vorhanden (oder Teilrechnung ohne MwSt-Ausweis)
     if brutto > 0:
         if calc_missing_vat:
             berechnet_netto = round(brutto / (1.0 + satz / 100.0), 2)
@@ -51,7 +51,7 @@ def _is_vr_match(auftrag: str, kreditor: str, gezahlt: float, full_text: str, be
     first_word = kreditor.lower().split()[0] if kreditor else ""
     if len(first_word) >= 4 and first_word in full_text:
         return True
-    if betrag_vr > 0 and abs(betrag_vr - gezahlt) < 0.01:
+    if betrag_vr > 0 and abs(betrag_vr - abs(gezahlt)) < 0.01:
         return True
     return False
 
@@ -79,7 +79,6 @@ def perform_three_way_match(
     rechnungen = {}
     lieferscheine = {}
 
-    # Gruppiert Belege nach normalisierter Auftrags-ID 
     for d in extracted_docs:
         key = _normalize_order_id(d.get("auftrags_nr", ""))
         if not key or key == "UNBEKANNT":
@@ -87,13 +86,17 @@ def perform_three_way_match(
 
         doc_type = str(d.get("dokument_typ", "")).lower()
         if "rechnung" in doc_type or "faktura" in doc_type:
+            has_missing_vat = float(d.get("gesamtbetrag_brutto") or 0.0) > 0 and float(d.get("mwst_betrag") or 0.0) == 0.0
             if key not in rechnungen:
                 rechnungen[key] = d.copy()
+                rechnungen[key]["_partial_missing_vat"] = has_missing_vat
             else:
                 rechnungen[key]["betrag_netto"] = round(float(rechnungen[key].get("betrag_netto") or 0.0) + float(d.get("betrag_netto") or 0.0), 2)
                 rechnungen[key]["mwst_betrag"] = round(float(rechnungen[key].get("mwst_betrag") or 0.0) + float(d.get("mwst_betrag") or 0.0), 2)
                 rechnungen[key]["gesamtbetrag_brutto"] = round(float(rechnungen[key].get("gesamtbetrag_brutto") or 0.0) + float(d.get("gesamtbetrag_brutto") or 0.0), 2)
                 rechnungen[key]["dateiname"] = f"{rechnungen[key]['dateiname']}, {d['dateiname']}"
+                if has_missing_vat:
+                    rechnungen[key]["_partial_missing_vat"] = True
         elif "lieferschein" in doc_type or "warenbegleitschein" in doc_type:
             if key not in lieferscheine:
                 lieferscheine[key] = d.copy()
@@ -114,7 +117,7 @@ def perform_three_way_match(
         l_file = l_doc.get("dateiname") if l_doc else "FEHLT"
 
         netto, mwst, satz, mwst_check = validate_vat_calculation(r_doc, calc_missing_vat=calc_missing_vat)
-        ist_wesentlich = max(gezahlt, r_betrag) >= threshold
+        ist_wesentlich = max(abs(gezahlt), abs(r_betrag)) >= threshold
         materialitaet = "WESENTLICH" if ist_wesentlich else "Unwesentlich"
 
         if r_doc and l_doc:
@@ -159,7 +162,7 @@ def build_vr_dataframe(protokoll_obj, threshold: float = 12000.0, df_buchungen: 
     rows = []
     for item in protokoll_obj.themen_extrakt:
         betrag = round(float(item.genannter_betrag_eur or 0.0), 2)
-        wesentlich = "WESENTLICH" if betrag >= threshold else "Unwesentlich"
+        wesentlich = "WESENTLICH" if abs(betrag) >= threshold else "Unwesentlich"
         full_text = f"{item.thema_kurz} {item.zusammenfassung_pruefung}".lower()
 
         verknuepfte_buchung = "Keine Buchung in CSV (z.B. Rückstellung/Risiko)"
@@ -192,6 +195,7 @@ def _style_worksheet(ws, df: pd.DataFrame, abs_pdf_folder: str):
     header_fill = PatternFill(start_color="1B365D", end_color="1B365D", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     ok_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    yellow_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
     warn_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
     info_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     link_font = Font(color="0563C1", underline="single")
@@ -206,20 +210,26 @@ def _style_worksheet(ws, df: pd.DataFrame, abs_pdf_folder: str):
         for col_idx, value in enumerate(row, start=1):
             cell = ws.cell(row=excel_row, column=col_idx, value=value)
             col_name = headers[col_idx - 1]
+            s_val = str(value)
 
             if isinstance(value, float):
                 cell.number_format = "#,##0.00"
 
             if col_name in ["Match_Status", "MwSt_Rechen_Check"]:
-                cell.fill = ok_fill if "OK" in str(value) else warn_fill
+                if "OK" in s_val:
+                    cell.fill = ok_fill
+                elif any(w in s_val for w in ["UNVOLLSTÄNDIG", "INFO", "MANGEL"]):
+                    cell.fill = yellow_fill
+                else:
+                    cell.fill = warn_fill
             elif col_name in ["Materialitaet", "Materialitaet_Bewertung"]:
                 cell.fill = warn_fill if value == "WESENTLICH" else ok_fill
             elif col_name in ["VR_Protokoll_Referenz", "Verknuepfte_Buchung_3Way"]:
-                if "VR-Bezug" in str(value) or "Verknüpft mit Buchung" in str(value):
+                if "VR-Bezug" in s_val or "Verknüpft mit Buchung" in s_val:
                     cell.fill = info_fill
 
             if col_name in ["Ref_Rechnung_PDF", "Ref_Lieferschein_PDF"] and value != "FEHLT":
-                first_pdf = str(value).split(",")[0].strip()
+                first_pdf = s_val.split(",")[0].strip()
                 full_pdf_path = os.path.join(abs_pdf_folder, first_pdf)
                 if os.path.exists(full_pdf_path):
                     cell.hyperlink = f"file:///{full_pdf_path}"

@@ -25,12 +25,16 @@ def reset_all():
     st.session_state["rc_tab1"] += 1
     st.session_state["rc_tab2"] += 1
     st.session_state["rc_tab3"] += 1
-    for k in ["df_clean", "df_buchungen", "pdf_store", "extracted_docs", "df_match", "skipped_docs", "protokoll_meta", "df_vr"]:
+    for k in [
+        "df_clean", "df_buchungen", "csv_loaded_name",
+        "pdf_store", "extracted_docs", "df_match", "skipped_docs",
+        "protokoll_meta", "df_vr", "calc_vat_toggle"
+    ]:
         st.session_state.pop(k, None)
 
 
 def reset_tab1():
-    for k in ["df_clean", "df_buchungen", "df_match"]:
+    for k in ["df_clean", "df_buchungen", "df_match", "csv_loaded_name"]:
         st.session_state.pop(k, None)
     st.session_state["rc_tab1"] += 1
 
@@ -47,22 +51,41 @@ def reset_tab3():
     st.session_state["rc_tab3"] += 1
 
 
+def _build_amount_search_terms(amount: float) -> list[str]:
+    """Erzeugt alle gängigen Schreibweisen (z.B. '1200.00', '1200,00', '1.200,00', '800') für das PDF-Highlighting."""
+    if not amount or amount <= 0:
+        return []
+    en_fmt = f"{amount:.2f}"                        # 1200.00
+    de_simple = en_fmt.replace(".", ",")            # 1200,00
+    en_thou = f"{amount:,.2f}"                      # 1,200.00
+    de_thou = en_thou.replace(",", "X").replace(".", ",").replace("X", ".")  # 1.200,00
+    variants = [en_fmt, de_simple, en_thou, de_thou]
+    if amount.is_integer():
+        int_str = str(int(amount))                  # 800
+        de_int_thou = f"{int(amount):,}".replace(",", ".")  # 1.200
+        variants.extend([int_str, de_int_thou])
+    return list(dict.fromkeys(variants))
+
+
 @st.cache_data(show_spinner=False)
 def render_pdf_page_with_highlights(pdf_bytes: bytes, search_terms: tuple = ()) -> bytes:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-    terms = [str(t).strip() for t in (search_terms or ()) if t and str(t).strip()]
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if len(doc) == 0:
+            return b""
+        page = doc[0]
+        terms = [str(t).strip() for t in (search_terms or ()) if t and str(t).strip()]
 
-    if len(page.get_text().strip()) > 20:
-        for term in terms:
-            for quad in page.search_for(term):
-                annot = page.add_highlight_annot(quad)
-                annot.update()
+        if len(page.get_text().strip()) > 20:
+            for term in terms:
+                for quad in page.search_for(term):
+                    annot = page.add_highlight_annot(quad)
+                    annot.update()
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            return pix.tobytes("png")
+
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-        return pix.tobytes("png")
+        img_bytes = pix.tobytes("png")
 
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-    img_bytes = pix.tobytes("png")
     if not terms:
         return img_bytes
 
@@ -92,7 +115,7 @@ def style_and_format_df(df: pd.DataFrame):
         if s == "WESENTLICH" or "KRITISCH" in s or "ABWEICHUNG" in s or "FEHLER" in s:
             return "background-color: #FCE4D6; color: #78281F; font-weight: bold;"
         if "UNVOLLSTÄNDIG" in s or "INFO -" in s or "MANGEL" in s:
-            return "background-color: #FFF2CC; color: #7D6608;"
+            return "background-color: #FFF2CC; color: #7D6608; font-weight: bold;"
         if s == "Unwesentlich" or "OK -" in s:
             return "background-color: #E2EFDA; color: #145A32;"
         if "VR-Bezug" in s or "Verknüpft mit Buchung" in s:
@@ -123,7 +146,6 @@ with col_reset:
     if st.button("🗑️ Alles zurücksetzen", width="stretch"):
         reset_all()
         st.rerun()
-
 
 with st.container(border=True):
     col_p1, col_p2, col_p3 = st.columns([1.4, 2.6, 1.2], vertical_alignment="center")
@@ -185,10 +207,10 @@ with tab1:
                 st.rerun()
 
     if not csv_file and "df_clean" in st.session_state:
-        st.session_state.pop("df_clean", None)
-        st.session_state.pop("df_buchungen", None)
+        for k in ["df_clean", "df_buchungen", "df_match", "csv_loaded_name"]:
+            st.session_state.pop(k, None)
 
-    if csv_file:
+    if csv_file and st.session_state.get("csv_loaded_name") != f"{csv_file.name}_{csv_file.size}":
         mapping = {
             "Ref_Auftrag": "auftrag_nr",
             "Gezahlter_Betrag_EUR": "betrag_gezahlt",
@@ -198,6 +220,7 @@ with tab1:
         try:
             df_clean = clean_and_map_csv(csv_file, mapping)
             st.session_state["df_clean"] = df_clean
+            st.session_state["csv_loaded_name"] = f"{csv_file.name}_{csv_file.size}"
         except Exception as e:
             st.error(f"❌ **Fehler in der CSV-Datei:** {e}")
             st.session_state.pop("df_clean", None)
@@ -284,6 +307,7 @@ with tab2:
                 calc_vat_flag = st.toggle(
                     "🧮 Fehlende MwSt kalkulatorisch herausrechnen (20 %)",
                     value=False,
+                    key="calc_vat_toggle",
                     help="Berechnet Netto & MwSt für Belege ohne Steuerausweis nach, behält aber den Prüfungsvermerk bei."
                 )
 
@@ -367,7 +391,7 @@ with tab2:
                         brutto_val = float(doc_info.get("gesamtbetrag_brutto") or 0.0)
                         satz_val = float(doc_info.get("mwst_satz_prozent") or 0.0)
                         st.info(
-                            f"**Erkannte KI-Daten:**\n\n"
+                            f"**Erkannte Beleg-Daten (Ist-Zustand):**\n\n"
                             f"- **Typ:** {doc_info['dokument_typ']}\n"
                             f"- **Beleg-Nr.:** {doc_info['beleg_nr']}\n"
                             f"- **Auftrags-Nr.:** {doc_info['auftrags_nr']}\n"
@@ -379,10 +403,11 @@ with tab2:
                     highlights = []
                     if doc_info:
                         highlights.append(doc_info.get("auftrags_nr"))
-                        if doc_info.get("gesamtbetrag_brutto"):
-                            highlights.append(f"{float(doc_info['gesamtbetrag_brutto']):.2f}")
+                        brutto_num = float(doc_info.get("gesamtbetrag_brutto") or 0.0)
+                        highlights.extend(_build_amount_search_terms(brutto_num))
                     img_bytes = render_pdf_page_with_highlights(pdf_store[selected_pdf], search_terms=tuple(highlights))
-                    st.image(img_bytes, caption=f"Vorschau: {selected_pdf}", width="stretch")
+                    if img_bytes:
+                        st.image(img_bytes, caption=f"Vorschau: {selected_pdf}", width="stretch")
 
 # TAB 3: Verwaltungsratsprotokoll (Prüfungsunterlagen-Extrakt & Cross-Link)
 with tab3:
@@ -424,7 +449,8 @@ with tab3:
                 st.session_state["df_buchungen"],
                 st.session_state["extracted_docs"],
                 threshold=threshold,
-                protokoll_obj=p
+                protokoll_obj=p,
+                calc_missing_vat=st.session_state.get("calc_vat_toggle", False)
             )
 
         col1, col2, col3 = st.columns(3)

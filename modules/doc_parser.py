@@ -1,5 +1,5 @@
 import re
-import fitz  
+import fitz
 from pydantic import BaseModel, Field
 from typing import List, Literal
 import ollama
@@ -37,7 +37,7 @@ class VRProtokoll(BaseModel):
 
 
 def _to_float(num_str: str) -> float:
-    """Wandelt '1.200,00' oder '1200.00' sicher in 1200.0 um."""
+    """Wandelt '1.200,00', '15.000' oder '1200.00' sicher in Float um."""
     s = num_str.strip()
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
@@ -45,7 +45,13 @@ def _to_float(num_str: str) -> float:
         else:
             s = s.replace(",", "")
     elif "," in s:
-        s = s.replace(",", ".")
+        if s.count(",") > 1 or re.match(r"^\d{1,3},\d{3}$", s):
+            s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
+    elif "." in s:
+        if s.count(".") > 1 or re.match(r"^\d{1,3}\.\d{3}$", s):
+            s = s.replace(".", "")
     try:
         return round(float(s), 2)
     except ValueError:
@@ -55,57 +61,62 @@ def _to_float(num_str: str) -> float:
 def _extract_amounts_from_text(raw_text: str) -> tuple[float, float, float, float]:
     """
     Deterministischer Python-Parser für den exakten IST-Zustand auf dem Beleg.
-    Füllt fehlende Netto-/MwSt-Werte NICHT künstlich auf, damit fehlende Steuerausweise
-    im Audit-Report sauber als Mangel/Info deklariert werden.
+    Filtert vorab Prozentsätze, Daten und IDs heraus, damit '20%' niemals als 20,00 € gelesen wird.
     """
     netto, satz, mwst, brutto = 0.0, 0.0, 0.0, 0.0
 
     for line in raw_text.splitlines():
         line_l = line.lower()
-        nums = re.findall(r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b|\b\d+\b", line)
+
+        # 1. Steuersatz (z.B. '20%' oder '20 %') vorab sichern
+        pct_match = re.search(r"(\d{1,2}(?:[.,]\d{1,2})?)\s*%", line_l)
+        if pct_match and any(k in line_l for k in ["mwst", "ust", "steuer"]):
+            satz = _to_float(pct_match.group(1))
+
+        # 2. Störzahlen (Prozente, Datum, Auftrags-/Rechnungs-IDs) aus der Zeile entfernen
+        clean_line = re.sub(r"\d{1,2}(?:[.,]\d{1,2})?\s*%", " ", line)
+        clean_line = re.sub(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}\.\d{2}\.\d{4}\b", " ", clean_line)
+        clean_line = re.sub(r"\b[A-Za-z]+-[\d-]+\b", " ", clean_line)
+
+        nums = re.findall(r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})\b|\b\d+\b", clean_line)
         floats = [_to_float(n) for n in nums if _to_float(n) > 0]
 
         if not floats:
             continue
 
-        # Prozent-Satz erkennen (z.B. '20%' oder '20 %'), falls auf Beleg angegeben
-        pct_match = re.search(r"(\d{1,2})\s*%", line_l)
-        if pct_match and any(k in line_l for k in ["mwst", "ust", "steuer"]):
-            satz = float(pct_match.group(1))
-
         val = floats[-1]
 
-        # 1. Eindeutige Brutto-Zeilen (inkl. USt, Endbetrag, Brutto, Zu zahlen)
+        # 3. Zuordnung nach Schlüsselwörtern
         if any(k in line_l for k in ["brutto", "endbetrag", "gesamtbetrag", "zahlbetrag", "zu zahlen", "inkl"]):
             brutto = val
-        # 2. Explizit ausgewiesene MwSt-Zeilen (ohne 'inkl.')
         elif any(k in line_l for k in ["mwst", "ust", "mehrwertsteuer", "umsatzsteuer"]) and "inkl" not in line_l:
             mwst = val
-        # 3. Explizit ausgewiesene Netto-Zeilen
         elif any(k in line_l for k in ["netto", "zwischensumme"]) and "inkl" not in line_l:
             netto = val
 
     return netto, satz, mwst, brutto
 
+
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if len(doc) == 0:
+                raise ValueError("Die PDF-Datei enthält keine Seiten.")
+
+            full_text = ""
+            for page in doc:
+                page_text = page.get_text().strip()
+                if len(page_text) > 20:
+                    full_text += page_text + "\n"
+                else:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    ocr_result, _ = ocr_engine(pix.tobytes("png"))
+                    if ocr_result:
+                        full_text += "\n".join([line[1] for line in ocr_result]) + "\n"
+    except ValueError:
+        raise
     except Exception as e:
         raise ValueError(f"Ungültige oder beschädigte PDF-Datei: {e}")
-
-    if len(doc) == 0:
-        raise ValueError("Die PDF-Datei enthält keine Seiten.")
-
-    full_text = ""
-    for page in doc:
-        page_text = page.get_text().strip()
-        if len(page_text) > 20:
-            full_text += page_text + "\n"
-        else:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            ocr_result, _ = ocr_engine(pix.tobytes("png"))
-            if ocr_result:
-                full_text += "\n".join([line[1] for line in ocr_result]) + "\n"
 
     if len(full_text.strip()) < 10:
         raise ValueError("Kein lesbarer Text im PDF gefunden.")
@@ -137,7 +148,8 @@ def parse_beleg_with_ollama(pdf_bytes: bytes, model_name: str = "llama3.1") -> B
     Du bist ein Wirtschaftsprüfungs-Assistent. Extrahiere die Belegdaten aus dem Text.
     WICHTIG bei Rechnungen: Lies 'betrag_netto' (z.B. 1000.0), 'mwst_satz_prozent' (z.B. 20.0), 
     'mwst_betrag' (z.B. 200.0) und 'gesamtbetrag_brutto' (z.B. 1200.0) exakt als Zahl aus!
-    Gib bei einer Rechnung NIEMALS 0 für gesamtbetrag_brutto zurück, wenn ein Betrag im Text steht!
+    Falls auf einer Rechnung nur der Bruttobetrag mit 'inkl. USt' ohne separaten MwSt-Betrag steht,
+    setze betrag_netto und mwst_betrag auf 0.0.
     
     Dokumententext:
     {raw_text}
@@ -154,18 +166,11 @@ def parse_beleg_with_ollama(pdf_bytes: bytes, model_name: str = "llama3.1") -> B
         raise RuntimeError(f"Lokale KI ({model_name}) Fehler: {e}")
 
     # 3. Deterministische Nachkontrolle in Python
-    # 3a. Auftragsnummer per Regex sichern 
     order_match = re.search(r"\bA-\d{3,5}\b", raw_text, re.IGNORECASE)
     if order_match:
         parsed.auftrags_nr = order_match.group(0).upper()
     else:
         parsed.auftrags_nr = str(parsed.auftrags_nr or "Unbekannt").strip().upper()
-
-    # 3b. Dokumenttyp eindeutig trennen (Lieferschein hat Vorrang, falls keine MwSt/Brutto-Summen existieren)
-    py_netto, py_satz, py_mwst, py_brutto = _extract_amounts_from_text(raw_text)
-
-   
-    py_netto, py_satz, py_mwst, py_brutto = _extract_amounts_from_text(raw_text)
 
     if "lieferschein" in text_lower or "warenbegleitschein" in text_lower:
         parsed.dokument_typ = "Lieferschein"
@@ -177,17 +182,15 @@ def parse_beleg_with_ollama(pdf_bytes: bytes, model_name: str = "llama3.1") -> B
 
     parsed.dokument_typ = "Rechnung"
 
-    
+    # Einmaliger Aufruf des deterministischen Python-Parsers
     py_netto, py_satz, py_mwst, py_brutto = _extract_amounts_from_text(raw_text)
 
     if py_brutto > 0:
-        # Python hat den Bruttobetrag sicher erkannt -> Ist-Werte vom Beleg übernehmen (auch wenn Netto/MwSt 0.0 sind!)
         parsed.gesamtbetrag_brutto = round(py_brutto, 2)
         parsed.betrag_netto = round(py_netto, 2)
         parsed.mwst_betrag = round(py_mwst, 2)
         parsed.mwst_satz_prozent = round(py_satz, 2)
     else:
-        # Fallback auf LLM-Werte, falls ungewöhnliches Beleg-Layout
         parsed.betrag_netto = round(float(parsed.betrag_netto or 0.0), 2)
         parsed.mwst_betrag = round(float(parsed.mwst_betrag or 0.0), 2)
         parsed.gesamtbetrag_brutto = round(float(parsed.gesamtbetrag_brutto or 0.0), 2)
