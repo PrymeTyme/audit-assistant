@@ -1,0 +1,5 @@
+Buchungsdatum_Klient;Ref_Auftrag;Kreditor_Name;Gezahlter_Betrag_EUR;Buchungstext
+2025-03-10;A-1001;AlpenTech GmbH;1200,00;Zahlung Server-Racks
+2025-03-12;A-1002;BüroProfi AG;950,00;Zahlung Bürostühle
+2025-03-16;A-1003;Consulting X;15000,00;Sonderberatung (Sonntagsbuchung!)
+2025-03-18;A-1004;IT-Solutions KG;450,00;Monatsgebühr Cloud

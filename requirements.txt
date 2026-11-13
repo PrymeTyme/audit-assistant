@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+pymupdf
+pydantic
+ollama
+reportlab
+rapidocr-onnxruntime
+pillow
